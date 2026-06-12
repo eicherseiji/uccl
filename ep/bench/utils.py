@@ -132,6 +132,21 @@ def _cuda_visible_device_count() -> Optional[int]:
     return len([token for token in visible_devices.split(",") if token.strip()])
 
 
+def _forced_num_nvl_ranks() -> Optional[int]:
+    value = os.environ.get("UCCL_FORCE_NUM_NVL_RANKS")
+    if value is None or value.strip() == "":
+        return None
+
+    try:
+        forced = int(value)
+    except ValueError as exc:
+        raise ValueError("UCCL_FORCE_NUM_NVL_RANKS must be an integer") from exc
+
+    if forced != 1:
+        raise ValueError("UCCL_FORCE_NUM_NVL_RANKS currently only supports 1")
+    return forced
+
+
 def _ray_assigned_gpu_ids() -> list[int]:
     try:
         import ray
@@ -199,6 +214,20 @@ def detect_group_topology(
         else assigned_gpu_id
     )
     visible_count = _cuda_visible_device_count()
+    forced_num_nvl_ranks = _forced_num_nvl_ranks()
+    if forced_num_nvl_ranks is not None:
+        if nic_local_rank is None:
+            nic_local_rank = 0
+        return (
+            local_rank,
+            nic_local_rank,
+            0,
+            forced_num_nvl_ranks,
+            rank,
+            world,
+            world == forced_num_nvl_ranks,
+        )
+
     if visible_count == 1:
         # CUDA IPC cannot be opened to same-node peer ranks when this process
         # can see only one GPU. Treat every process as its own NVL group and

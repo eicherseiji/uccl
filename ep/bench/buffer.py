@@ -26,6 +26,7 @@ try:
         _fp8_e4m3_dtype,
         _cuda_visible_device_count,
         _current_cuda_device_index,
+        _forced_num_nvl_ranks,
         _ray_assigned_gpu_ids,
     )
 except ImportError:
@@ -37,6 +38,7 @@ except ImportError:
         _fp8_e4m3_dtype,
         _cuda_visible_device_count,
         _current_cuda_device_index,
+        _forced_num_nvl_ranks,
         _ray_assigned_gpu_ids,
     )
 
@@ -158,7 +160,10 @@ class Buffer:
                 )
 
         rdma_buffer_ptr = self.scratch.data_ptr()
-        if "LOCAL_WORLD_SIZE" in os.environ:
+        forced_num_nvl_ranks = _forced_num_nvl_ranks()
+        if forced_num_nvl_ranks is not None:
+            _local_world = forced_num_nvl_ranks
+        elif "LOCAL_WORLD_SIZE" in os.environ:
             _local_world = int(os.environ["LOCAL_WORLD_SIZE"])
         else:
             visible_count = _cuda_visible_device_count()
