@@ -7,6 +7,7 @@
 #include <arpa/inet.h>  // for htonl, ntohl
 #include <chrono>
 #include <cstdlib>
+#include <string>
 #include <thread>
 #include <errno.h>
 #include <fcntl.h>
@@ -84,6 +85,34 @@ void unmap_local_barrier_shm(std::string const& name, LocalBarrier* lb,
   if (owner) shm_unlink(name.c_str());
 }
 #endif
+
+static bool uses_virtual_single_rank_nodes(Proxy::Config const& cfg) {
+  return cfg.num_nodes > 0 && cfg.num_nodes == cfg.num_ranks;
+}
+
+static bool should_connect_peer(std::vector<PeerMeta> const& peers, int my_rank,
+                                int peer, Proxy::Config const& cfg) {
+  if (peer == my_rank) return false;
+
+  bool const virtual_single_rank_nodes = uses_virtual_single_rank_nodes(cfg);
+  if (!virtual_single_rank_nodes && peers[peer].ip == peers[my_rank].ip)
+    return false;
+  if (cfg.use_normal_mode && !virtual_single_rank_nodes &&
+      std::abs(peer - my_rank) % MAX_NUM_GPUS != 0)
+    return false;
+
+  return true;
+}
+
+static std::string barrier_key_for_rank(std::vector<PeerMeta> const& peers,
+                                        int rank,
+                                        bool virtual_single_rank_nodes) {
+  std::string key = (rank >= 0 && rank < static_cast<int>(peers.size()))
+                        ? peers[rank].ip
+                        : "";
+  if (virtual_single_rank_nodes) key += "_rank" + std::to_string(rank);
+  return key;
+}
 
 Proxy::Proxy(Config const& cfg) : cfg_(cfg) {
   // Unset (-1) device/NIC ranks fall back to local_rank.
@@ -273,10 +302,7 @@ void Proxy::init_common() {
     // Pre-post recv WRs once on the shared recv_ack_qp, sized for all peers.
     int num_active_peers = 0;
     for (int p = 0; p < num_ranks; ++p) {
-      if (p == my_rank) continue;
-      if (peers_[p].ip == peers_[my_rank].ip) continue;
-      if (cfg_.use_normal_mode && std::abs(p - my_rank) % MAX_NUM_GPUS != 0)
-        continue;
+      if (!should_connect_peer(peers_, my_rank, p, cfg_)) continue;
       ++num_active_peers;
     }
     int const ack_depth =
@@ -313,11 +339,7 @@ void Proxy::init_common() {
     c.atomic_old_values_buf = ctx_.atomic_old_values_buf;
     c.atomic_old_values_mr = ctx_.atomic_old_values_mr;
 
-    if (peer == my_rank) continue;
-    // Skip rdma connection for intra-node.
-    if (peers_[peer].ip == peers_[my_rank].ip) continue;
-    if (cfg_.use_normal_mode && std::abs(peer - my_rank) % MAX_NUM_GPUS != 0)
-      continue;
+    if (!should_connect_peer(peers_, my_rank, peer, cfg_)) continue;
 #ifdef EFA
     // Alias the shared SRD QPs from ctx_; dst_ah/dst_qpn (set later in
     // modify_qp_to_rtr) routes per WR via ibv_wr_set_ud_addr.
@@ -342,11 +364,7 @@ void Proxy::init_common() {
   // Out-of-band exchange info per pair: start receiver thread first
   std::thread receiver_thread([this, num_ranks, my_rank]() {
     for (int peer = 0; peer < num_ranks; ++peer) {
-      // Skip rdma connection for intra-node.
-      if (peer == my_rank || peers_[peer].ip == peers_[my_rank].ip ||
-          (cfg_.use_normal_mode &&
-           std::abs(peer - my_rank) % MAX_NUM_GPUS != 0))
-        continue;
+      if (!should_connect_peer(peers_, my_rank, peer, cfg_)) continue;
       int actual_peer;
       recv_connection_info_as_server(my_rank, &actual_peer, listen_fd_,
                                      remote_infos_.data());
@@ -355,9 +373,7 @@ void Proxy::init_common() {
 
   // Then send our info to all peers
   for (int peer = 0; peer < num_ranks; ++peer) {
-    if (peer == my_rank || peers_[peer].ip == peers_[my_rank].ip ||
-        (cfg_.use_normal_mode && std::abs(peer - my_rank) % MAX_NUM_GPUS != 0))
-      continue;
+    if (!should_connect_peer(peers_, my_rank, peer, cfg_)) continue;
     char const* peer_ip = peers_[peer].ip.c_str();
     int const peer_listen_port = peers_[peer].listen_ports[cfg_.thread_idx];
     send_connection_info_as_client(my_rank, peer, peer_ip, peer_listen_port,
@@ -369,9 +385,7 @@ void Proxy::init_common() {
 
   // Verify remote info correctness
   for (int peer = 0; peer < num_ranks; ++peer) {
-    if (peer == my_rank || peers_[peer].ip == peers_[my_rank].ip ||
-        (cfg_.use_normal_mode && std::abs(peer - my_rank) % MAX_NUM_GPUS != 0))
-      continue;
+    if (!should_connect_peer(peers_, my_rank, peer, cfg_)) continue;
     if (remote_infos_[peer].addr != peers_[peer].ptr) {
       fprintf(stderr,
               "Rank %d thread %d: Warning: remote addr mismatch for peer %d: "
@@ -384,11 +398,7 @@ void Proxy::init_common() {
 
   // Bring each per-peer QP to RTR/RTS
   for (int peer = 0; peer < num_ranks; ++peer) {
-    if (peer == my_rank) continue;
-    // Skip rdma connection for intra-node.
-    if (peers_[peer].ip == peers_[my_rank].ip) continue;
-    if (cfg_.use_normal_mode && std::abs(peer - my_rank) % MAX_NUM_GPUS != 0)
-      continue;
+    if (!should_connect_peer(peers_, my_rank, peer, cfg_)) continue;
     auto& c = *ctxs_for_all_ranks_[peer];
 
     // qp is different from each rank.
@@ -450,15 +460,26 @@ void Proxy::init_common() {
     // if (cfg_.thread_idx != 0) {
     //   return;
     // }
-    // Discover local ranks (same IP as me)
-    std::string const my_ip = peers_[cfg_.rank].ip;
     std::vector<int> local_ranks;
     local_ranks.reserve(ctxs_for_all_ranks_.size());
     int leader_rank = cfg_.rank;
-    for (int r = 0; r < (int)peers_.size(); ++r) {
-      if (peers_[r].ip == my_ip) {
-        local_ranks.push_back(r);
-        if (r < leader_rank) leader_rank = r;
+    bool const virtual_single_rank_nodes = uses_virtual_single_rank_nodes(cfg_);
+    std::string const barrier_key =
+        barrier_key_for_rank(peers_, cfg_.rank, virtual_single_rank_nodes);
+
+    if (virtual_single_rank_nodes) {
+      // Some executors expose one physical GPU per process as cuda:0. In that
+      // topology CUDA IPC is unavailable between same-host peers, so Python
+      // models every process as its own RDMA/NVL group and barrier namespace.
+      local_ranks.push_back(cfg_.rank);
+    } else {
+      // Discover local ranks (same IP as me).
+      std::string const my_ip = peers_[cfg_.rank].ip;
+      for (int r = 0; r < (int)peers_.size(); ++r) {
+        if (peers_[r].ip == my_ip) {
+          local_ranks.push_back(r);
+          if (r < leader_rank) leader_rank = r;
+        }
       }
     }
     ctx_.num_local_ranks = (int)local_ranks.size();
@@ -481,8 +502,8 @@ void Proxy::init_common() {
       std::abort();
     }
 #ifndef USE_SUBSET_BARRIER
-    std::string const shm_name =
-        shm_name_for_barrier(my_ip, cfg_.use_normal_mode, cfg_.thread_idx);
+    std::string const shm_name = shm_name_for_barrier(
+        barrier_key, cfg_.use_normal_mode, cfg_.thread_idx);
     ctx_.lb = map_local_barrier_shm(shm_name, &ctx_.lb_owner);
     if (!ctx_.lb) {
       fprintf(stderr, "Failed to map local barrier shm: %s\n",
@@ -569,10 +590,7 @@ void Proxy::run_remote() {
 void Proxy::run_dual() {
   init_common();
   for (int peer = 0; peer < (int)ctxs_for_all_ranks_.size(); ++peer) {
-    if (peer == cfg_.rank) continue;
-    if (peers_[peer].ip == peers_[cfg_.rank].ip) continue;
-    if (cfg_.use_normal_mode && std::abs(peer - cfg_.rank) % MAX_NUM_GPUS != 0)
-      continue;
+    if (!should_connect_peer(peers_, cfg_.rank, peer, cfg_)) continue;
     auto& ctx_ptr = ctxs_for_all_ranks_[peer];
     if (!ctx_ptr) continue;
 #ifndef EFA
@@ -793,7 +811,8 @@ void Proxy::post_gpu_command(uint64_t& my_tail, size_t& seen) {
           cudaDeviceSynchronize();
           std::abort();
         }
-        if (peers_[cmd_entry.dst_rank].ip == peers_[cfg_.rank].ip) {
+        if (!uses_virtual_single_rank_nodes(cfg_) &&
+            peers_[cmd_entry.dst_rank].ip == peers_[cfg_.rank].ip) {
           fprintf(
               stderr,
               "[ERROR] Intra-node command!, cmd.dst_rank: %d, cfg_.rank: %d, "
@@ -1039,7 +1058,8 @@ void Proxy::post_gpu_commands_mixed(
   if (!rdma_wrs.empty()) {
     post_rdma_async_batched(ctx_, cfg_.gpu_buffer, rdma_wrs.size(), rdma_wrs,
                             rdma_cmds, ctxs_for_all_ranks_, cfg_.rank,
-                            cfg_.thread_idx, cfg_.use_normal_mode);
+                            cfg_.thread_idx, cfg_.use_normal_mode,
+                            uses_virtual_single_rank_nodes(cfg_));
     rdma_wrs.clear();
     rdma_cmds.clear();
   }
@@ -1300,10 +1320,10 @@ void Proxy::destroy(bool free_gpu_buffer) {
     ctx_.context = nullptr;
   }
 #ifndef USE_SUBSET_BARRIER
-  std::string const my_ip =
-      (cfg_.rank < (int)peers_.size()) ? peers_[cfg_.rank].ip : "";
+  std::string const barrier_key = barrier_key_for_rank(
+      peers_, cfg_.rank, uses_virtual_single_rank_nodes(cfg_));
   std::string const shm_name =
-      shm_name_for_barrier(my_ip, cfg_.use_normal_mode, cfg_.thread_idx);
+      shm_name_for_barrier(barrier_key, cfg_.use_normal_mode, cfg_.thread_idx);
   unmap_local_barrier_shm(shm_name, ctx_.lb, ctx_.lb_owner);
   ctx_.lb = nullptr;
   ctx_.lb_owner = false;
@@ -1429,17 +1449,23 @@ void Proxy::barrier_check() {
 
   if (cfg_.node_idx == 0) {
     if (ctx_.barrier_arrival_count == cfg_.num_nodes) {
-      std::unordered_map<std::string, int> leader_for_ip;
-      for (int r = 0; r < (int)peers_.size(); ++r) {
-        if (r >= MAX_NUM_GPUS && (r - cfg_.rank) % MAX_NUM_GPUS == 0) {
-          leader_for_ip[peers_[r].ip] = r;
+      if (uses_virtual_single_rank_nodes(cfg_)) {
+        for (int leader_r = 1; leader_r < (int)peers_.size(); ++leader_r) {
+          post_barrier_msg(leader_r, true, seq);
         }
-      }
-      for (auto const& kv : leader_for_ip) {
-        std::string const& ip = kv.first;
-        int leader_r = kv.second;
-        if (ip == peers_[0].ip) continue;
-        post_barrier_msg(leader_r, true, seq);
+      } else {
+        std::unordered_map<std::string, int> leader_for_ip;
+        for (int r = 0; r < (int)peers_.size(); ++r) {
+          if (r >= MAX_NUM_GPUS && (r - cfg_.rank) % MAX_NUM_GPUS == 0) {
+            leader_for_ip[peers_[r].ip] = r;
+          }
+        }
+        for (auto const& kv : leader_for_ip) {
+          std::string const& ip = kv.first;
+          int leader_r = kv.second;
+          if (ip == peers_[0].ip) continue;
+          post_barrier_msg(leader_r, true, seq);
+        }
       }
       ctx_.barrier_arrived.clear();
       ctx_.barrier_arrival_count = 0;
@@ -1507,19 +1533,25 @@ void Proxy::barrier_check() {
 
       if (cfg_.rank == 0) {
         if (ctx_.barrier_arrival_count == cfg_.num_nodes) {
-          std::unordered_map<std::string, int> leader_for_ip;
-          for (int r = 0; r < (int)peers_.size(); ++r) {
-            auto it = leader_for_ip.find(peers_[r].ip);
-            if (it == leader_for_ip.end() || r < it->second) {
-              assert(r % MAX_NUM_GPUS == 0);
-              leader_for_ip[peers_[r].ip] = r;
+          if (uses_virtual_single_rank_nodes(cfg_)) {
+            for (int leader_r = 1; leader_r < (int)peers_.size(); ++leader_r) {
+              post_barrier_msg(leader_r, true, seq);
             }
-          }
-          for (auto const& kv : leader_for_ip) {
-            std::string const& ip = kv.first;
-            int leader_r = kv.second;
-            if (ip == peers_[0].ip) continue;
-            post_barrier_msg(leader_r, true, seq);
+          } else {
+            std::unordered_map<std::string, int> leader_for_ip;
+            for (int r = 0; r < (int)peers_.size(); ++r) {
+              auto it = leader_for_ip.find(peers_[r].ip);
+              if (it == leader_for_ip.end() || r < it->second) {
+                assert(r % MAX_NUM_GPUS == 0);
+                leader_for_ip[peers_[r].ip] = r;
+              }
+            }
+            for (auto const& kv : leader_for_ip) {
+              std::string const& ip = kv.first;
+              int leader_r = kv.second;
+              if (ip == peers_[0].ip) continue;
+              post_barrier_msg(leader_r, true, seq);
+            }
           }
 
           for (int lr = 0; lr < ctx_.num_local_ranks; ++lr) {

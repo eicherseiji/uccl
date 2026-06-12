@@ -132,13 +132,17 @@ struct FifoDeviceHandle {
 #if __CUDA_ARCH__ == 800
     // This is faster than release for A100.
     __threadfence_system();
-    asm volatile(
-        "st.global.relaxed.sys.v2.u64 [%0], {%1,%2};" ::"l"(triggerPtr),
-        "l"(trigger.fst), "l"(trigger.snd));
+    auto* triggerWords = reinterpret_cast<uint64_t*>(triggerPtr);
+    asm volatile("st.global.relaxed.sys.u64 [%0], %1;" ::"l"(triggerWords + 1),
+                 "l"(trigger.snd));
+    asm volatile("st.global.relaxed.sys.u64 [%0], %1;" ::"l"(triggerWords),
+                 "l"(trigger.fst));
 #else
-    asm volatile(
-        "st.global.release.sys.v2.u64 [%0], {%1,%2};" ::"l"(triggerPtr),
-        "l"(trigger.fst), "l"(trigger.snd));
+    auto* triggerWords = reinterpret_cast<uint64_t*>(triggerPtr);
+    asm volatile("st.global.relaxed.sys.u64 [%0], %1;" ::"l"(triggerWords + 1),
+                 "l"(trigger.snd));
+    asm volatile("st.global.release.sys.u64 [%0], %1;" ::"l"(triggerWords),
+                 "l"(trigger.fst));
 #endif
 #else   // !defined(MSCCLPP_DEVICE_CUDA)
     // Store snd no later than fst.

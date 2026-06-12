@@ -2,8 +2,10 @@
 #include "ep_configs.cuh"
 #include "ep_util.hpp"
 #include "internode.cuh"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <utility>
 
 #define LOW_LATENCY_SEND_PHASE 1
@@ -19,6 +21,42 @@ dtype_t ceil_div(dtype_t a, dtype_t b) {
 template <typename dtype_t>
 dtype_t align(dtype_t a, dtype_t b) {
   return ceil_div<dtype_t>(a, b) * b;
+}
+
+inline int count_cuda_visible_devices(char const* visible_devices) {
+  if (visible_devices == nullptr || visible_devices[0] == '\0') return 0;
+
+  int count = 0;
+  bool in_token = false;
+  for (char const* p = visible_devices; *p != '\0'; ++p) {
+    if (*p == ',') {
+      count += static_cast<int>(in_token);
+      in_token = false;
+    } else if (*p != ' ') {
+      in_token = true;
+    }
+  }
+  count += static_cast<int>(in_token);
+  return count;
+}
+
+inline int infer_runtime_num_nvl_peers() {
+  if (char const* env = std::getenv("LOCAL_WORLD_SIZE")) {
+    int const value = std::atoi(env);
+    if (value > 0 && value <= NUM_MAX_NVL_PEERS) return value;
+  }
+
+  // vLLM's Ray executor gives each worker actor one CUDA-visible GPU.
+  if (count_cuda_visible_devices(std::getenv("CUDA_VISIBLE_DEVICES")) == 1) {
+    return 1;
+  }
+
+  return NUM_MAX_NVL_PEERS;
+}
+
+inline int infer_num_nvl_ranks(int num_ranks) {
+  int const num_nvl_peers = infer_runtime_num_nvl_peers();
+  return std::min(num_ranks, num_nvl_peers);
 }
 
 // thirdparty/DeepEP/csrc/config.hpp
@@ -57,16 +95,17 @@ struct Config {
                    num_max_rdma_chunked_recv_tokens / 2);
   }
 
-  size_t get_nvl_buffer_size_hint(size_t hidden_bytes, int num_ranks) const {
+  size_t get_nvl_buffer_size_hint_with_nvl(size_t hidden_bytes, int num_ranks,
+                                           int num_nvl_ranks) const {
     // Below are some assumptions
     // TODO: add assertions
     constexpr int kNumMaxTopK = 128;
     constexpr int kNumMaxScales = 128;
-    EP_HOST_ASSERT(num_ranks < NUM_MAX_NVL_PEERS or
-                   num_ranks % NUM_MAX_NVL_PEERS == 0);
-    EP_HOST_ASSERT(num_ranks <= NUM_MAX_NVL_PEERS or num_sms % 2 == 0);
-    auto const num_rdma_ranks = std::max(num_ranks / NUM_MAX_NVL_PEERS, 1);
-    auto const num_nvl_ranks = std::min(num_ranks, NUM_MAX_NVL_PEERS);
+    EP_HOST_ASSERT(num_nvl_ranks > 0 && num_nvl_ranks <= NUM_MAX_NVL_PEERS);
+    EP_HOST_ASSERT(num_ranks <= num_nvl_ranks or
+                   num_ranks % num_nvl_ranks == 0);
+    EP_HOST_ASSERT(num_ranks <= num_nvl_ranks or num_sms % 2 == 0);
+    auto const num_rdma_ranks = std::max(num_ranks / num_nvl_ranks, 1);
     int const num_channels = num_sms / 2;
 
     size_t num_bytes = 0;
@@ -91,23 +130,30 @@ struct Config {
     return num_bytes;
   }
 
-  size_t get_rdma_buffer_size_hint(int64_t hidden_bytes, int num_ranks) const {
+  size_t get_nvl_buffer_size_hint(size_t hidden_bytes, int num_ranks) const {
+    return get_nvl_buffer_size_hint_with_nvl(hidden_bytes, num_ranks,
+                                             infer_num_nvl_ranks(num_ranks));
+  }
+
+  size_t get_rdma_buffer_size_hint_with_nvl(int64_t hidden_bytes, int num_ranks,
+                                            int num_nvl_ranks) const {
 #ifndef DISABLE_NVSHMEM
     // Legacy mode
-    if (num_ranks <= NUM_MAX_NVL_PEERS) return 0;
+    if (num_ranks <= num_nvl_ranks) return 0;
 
     // Below are some assumptions
     // TODO: add assertions
     constexpr int kNumMaxTopK = 128;
     constexpr int kNumMaxScales = 128;
-    EP_HOST_ASSERT(num_ranks % NUM_MAX_NVL_PEERS == 0);
+    EP_HOST_ASSERT(num_nvl_ranks > 0 && num_nvl_ranks <= NUM_MAX_NVL_PEERS);
+    EP_HOST_ASSERT(num_ranks % num_nvl_ranks == 0);
     EP_HOST_ASSERT(num_sms % 2 == 0);
-    int const num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
+    int const num_rdma_ranks = num_ranks / num_nvl_ranks;
     int const num_channels = num_sms / 2;
 
     size_t num_bytes = 0;
-    num_bytes += num_channels * num_rdma_ranks * (NUM_MAX_NVL_PEERS * 2 + 2) *
-                 2 * sizeof(int);
+    num_bytes += num_channels * num_rdma_ranks * (num_nvl_ranks * 2 + 2) * 2 *
+                 sizeof(int);
     num_bytes += num_channels * num_rdma_ranks *
                  num_max_rdma_chunked_recv_tokens * hidden_bytes * 2;
     num_bytes += num_channels * num_rdma_ranks *
@@ -129,6 +175,11 @@ struct Config {
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disable during compilation");
 #endif
+  }
+
+  size_t get_rdma_buffer_size_hint(int64_t hidden_bytes, int num_ranks) const {
+    return get_rdma_buffer_size_hint_with_nvl(hidden_bytes, num_ranks,
+                                              infer_num_nvl_ranks(num_ranks));
   }
 };
 

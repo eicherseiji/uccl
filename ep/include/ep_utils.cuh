@@ -902,6 +902,11 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs,
     __syncthreads();
   }
 
+  if constexpr (kNumRanks == 1) {
+    __syncthreads();
+    return;
+  }
+
   // Add self-ranks, sub other ranks
   if (thread_id < kNumRanks) {
     atomicAdd_system(barrier_signal_ptrs[rank] + thread_id, FINISHED_SUM_TAG);

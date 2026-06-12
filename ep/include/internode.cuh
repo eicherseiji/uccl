@@ -19,7 +19,8 @@ __host__ __device__ __forceinline__ int get_num_bytes_per_token(
 
 __host__ __device__ __forceinline__ std::pair<int, int> get_rdma_clean_meta(
     int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights,
-    int num_rdma_ranks, int num_rdma_recv_buffer_tokens, int num_channels);
+    int num_rdma_ranks, int num_nvl_ranks, int num_rdma_recv_buffer_tokens,
+    int num_channels);
 
 __host__ __device__ __forceinline__ std::pair<int, int> get_nvl_clean_meta(
     int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights,
@@ -28,11 +29,12 @@ __host__ __device__ __forceinline__ std::pair<int, int> get_nvl_clean_meta(
 
 void notify_dispatch(
     int const* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
-    int const* num_tokens_per_rdma_rank, int* moe_recv_rdma_counter_mapped,
-    int const* num_tokens_per_expert, int* moe_recv_expert_counter_mapped,
-    int num_experts, bool const* is_token_in_rank, int num_tokens,
-    int num_worst_tokens, int num_channels, int hidden_int4, int num_scales,
-    int num_topk, int expert_alignment, int* rdma_channel_prefix_matrix,
+    int num_nvl_ranks, int const* num_tokens_per_rdma_rank,
+    int* moe_recv_rdma_counter_mapped, int const* num_tokens_per_expert,
+    int* moe_recv_expert_counter_mapped, int num_experts,
+    bool const* is_token_in_rank, int num_tokens, int num_worst_tokens,
+    int num_channels, int hidden_int4, int num_scales, int num_topk,
+    int expert_alignment, int* rdma_channel_prefix_matrix,
     int* recv_rdma_rank_prefix_sum, int* gbl_channel_prefix_matrix,
     int* recv_gbl_rank_prefix_sum, void* rdma_buffer_ptr,
     int num_max_rdma_chunked_recv_tokens, void** buffer_ptrs,
@@ -42,8 +44,9 @@ void notify_dispatch(
     int num_d2h_channel_addrs, void* atomic_buffer_ptr);
 
 void cached_notify(int hidden_int4, int num_scales, int num_topk_idx,
-                   int num_topk_weights, int num_ranks, int num_channels,
-                   int num_combined_tokens, int* combined_rdma_head,
+                   int num_topk_weights, int num_ranks, int num_nvl_ranks,
+                   int num_channels, int num_combined_tokens,
+                   int* combined_rdma_head,
                    int const* rdma_channel_prefix_matrix,
                    int const* rdma_rank_prefix_sum, int* combined_nvl_head,
                    void* rdma_buffer_ptr, int num_max_rdma_chunked_recv_tokens,
@@ -68,8 +71,8 @@ void dispatch(
     int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
     void** buffer_ptrs, int num_max_nvl_chunked_send_tokens,
     int num_max_nvl_chunked_recv_tokens, int rank, int num_ranks,
-    bool is_cached_dispatch, cudaStream_t stream, int num_channels,
-    bool low_latency_mode, uint64_t const* d2h_channel_addrs,
+    int num_nvl_ranks, bool is_cached_dispatch, cudaStream_t stream,
+    int num_channels, bool low_latency_mode, uint64_t const* d2h_channel_addrs,
     int num_d2h_channel_addrs, void* atomic_buffer_ptr);
 
 void combine(cudaDataType_t type, void* combined_x,
@@ -85,9 +88,9 @@ void combine(cudaDataType_t type, void* combined_x,
              int num_max_rdma_chunked_recv_tokens, void** buffer_ptrs,
              int num_max_nvl_chunked_send_tokens,
              int num_max_nvl_chunked_recv_tokens, int rank, int num_ranks,
-             cudaStream_t stream, int num_channels, bool low_latency_mode,
-             uint64_t const* d2h_channel_addrs, int num_d2h_channel_addrs,
-             void* atomic_buffer_ptr);
+             int num_nvl_ranks, cudaStream_t stream, int num_channels,
+             bool low_latency_mode, uint64_t const* d2h_channel_addrs,
+             int num_d2h_channel_addrs, void* atomic_buffer_ptr);
 
 }  // namespace internode
 }  // namespace uccl

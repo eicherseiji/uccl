@@ -75,23 +75,67 @@
     }                                                   \
   } while (false)
 
-#define SWITCH_RDMA_RANKS(case_macro)                      \
-  do {                                                     \
-    switch (num_ranks / NUM_MAX_NVL_PEERS) {               \
-      case 2:                                              \
-        case_macro(2);                                     \
-      case 3:                                              \
-        case_macro(3);                                     \
-      case 4:                                              \
-        case_macro(4);                                     \
-      case 8:                                              \
-        case_macro(8);                                     \
-      case 16:                                             \
-        case_macro(16);                                    \
-      default:                                             \
-        EP_HOST_ASSERT(false && "Unsupported RDMA ranks"); \
-    }                                                      \
+#define SWITCH_NUM_RDMA_RANKS(num_rdma_ranks_value, case_macro) \
+  do {                                                          \
+    switch (num_rdma_ranks_value) {                             \
+      case 2:                                                   \
+        case_macro(2);                                          \
+      case 3:                                                   \
+        case_macro(3);                                          \
+      case 4:                                                   \
+        case_macro(4);                                          \
+      case 8:                                                   \
+        case_macro(8);                                          \
+      case 16:                                                  \
+        case_macro(16);                                         \
+      default:                                                  \
+        EP_HOST_ASSERT(false && "Unsupported RDMA ranks");      \
+    }                                                           \
   } while (false)
+
+#define SWITCH_NUM_NVL_PEERS_FOR_RDMA(num_nvl_peers_value, num_rdma_ranks, \
+                                      case_macro)                          \
+  do {                                                                     \
+    switch (num_nvl_peers_value) {                                         \
+      case 1:                                                              \
+        case_macro(num_rdma_ranks, 1);                                     \
+      case 2:                                                              \
+        case_macro(num_rdma_ranks, 2);                                     \
+      case 4:                                                              \
+        case_macro(num_rdma_ranks, 4);                                     \
+      case 8:                                                              \
+        case_macro(num_rdma_ranks, 8);                                     \
+      default:                                                             \
+        EP_HOST_ASSERT(false && "Unsupported NVL peers");                  \
+    }                                                                      \
+  } while (false)
+
+#define SWITCH_RDMA_NVL_RANKS(num_rdma_ranks_value, num_nvl_peers_value,    \
+                              case_macro)                                   \
+  do {                                                                      \
+    switch (num_rdma_ranks_value) {                                         \
+      case 2:                                                               \
+        SWITCH_NUM_NVL_PEERS_FOR_RDMA(num_nvl_peers_value, 2, case_macro);  \
+        break;                                                              \
+      case 3:                                                               \
+        SWITCH_NUM_NVL_PEERS_FOR_RDMA(num_nvl_peers_value, 3, case_macro);  \
+        break;                                                              \
+      case 4:                                                               \
+        SWITCH_NUM_NVL_PEERS_FOR_RDMA(num_nvl_peers_value, 4, case_macro);  \
+        break;                                                              \
+      case 8:                                                               \
+        SWITCH_NUM_NVL_PEERS_FOR_RDMA(num_nvl_peers_value, 8, case_macro);  \
+        break;                                                              \
+      case 16:                                                              \
+        SWITCH_NUM_NVL_PEERS_FOR_RDMA(num_nvl_peers_value, 16, case_macro); \
+        break;                                                              \
+      default:                                                              \
+        EP_HOST_ASSERT(false && "Unsupported RDMA ranks");                  \
+    }                                                                       \
+  } while (false)
+
+#define SWITCH_RDMA_RANKS(case_macro) \
+  SWITCH_NUM_RDMA_RANKS(num_ranks / NUM_MAX_NVL_PEERS, case_macro)
 
 #define SWITCH_RANKS(case_macro)                       \
   do {                                                 \

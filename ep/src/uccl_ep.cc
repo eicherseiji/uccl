@@ -25,9 +25,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -413,7 +415,11 @@ class Buffer {
       }
     }
 
-    int64_t const barrier_signal_bytes = max_nvl_peers * sizeof(int);
+    auto const align_i64 = [](int64_t value, int64_t alignment) {
+      return ((value + alignment - 1) / alignment) * alignment;
+    };
+    int64_t const barrier_signal_bytes =
+        align_i64(max_nvl_peers * sizeof(int), sizeof(void*));
     int64_t const buffer_ptr_bytes = max_nvl_peers * sizeof(void*);
     int64_t const barrier_signal_ptr_bytes = max_nvl_peers * sizeof(int*);
 
@@ -542,7 +548,7 @@ class Buffer {
       if (num_tokens_per_rdma_rank_ptr != 0) {
         CUDA_CHECK(cudaMemsetAsync(
             reinterpret_cast<void*>(num_tokens_per_rdma_rank_ptr), 0,
-            num_ranks * sizeof(int), comm_stream));
+            num_rdma_ranks * sizeof(int), comm_stream));
       }
       CUDA_CHECK(
           cudaMemsetAsync(reinterpret_cast<void*>(num_tokens_per_expert_ptr), 0,
@@ -586,7 +592,7 @@ class Buffer {
     uccl::layout::get_dispatch_layout(
         topk_idx, num_tokens_per_rank, num_tokens_per_rdma_rank,
         num_tokens_per_expert, is_token_in_rank, num_tokens, num_topk,
-        num_ranks, num_experts, comm_stream);
+        num_ranks, num_nvl_ranks, num_experts, comm_stream);
 
     std::optional<EventHandle> event;
     if (async) {
@@ -969,7 +975,7 @@ class Buffer {
 
     uccl::internode::notify_dispatch(
         reinterpret_cast<int const*>(num_tokens_per_rank_ptr),
-        moe_recv_counter_mapped, num_ranks,
+        moe_recv_counter_mapped, num_ranks, num_nvl_ranks,
         reinterpret_cast<int const*>(num_tokens_per_rdma_rank_ptr),
         moe_recv_rdma_counter_mapped,
         reinterpret_cast<int const*>(num_tokens_per_expert_ptr),
@@ -984,7 +990,8 @@ class Buffer {
         config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
         config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu, rank,
         comm_stream,
-        config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
+        config.get_rdma_buffer_size_hint_with_nvl(hidden_int4 * sizeof(int4),
+                                                  num_ranks, num_nvl_ranks),
         num_nvl_bytes, low_latency_mode, d_handles, num_d2h_channel_addrs,
         atomic_buffer_ptr);
 
@@ -1007,7 +1014,22 @@ class Buffer {
         if (std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::high_resolution_clock::now() - start_time)
                 .count() > get_cpu_timeout_secs(NUM_CPU_TIMEOUT_SECS)) {
-          throw std::runtime_error("DeepEP error: timeout (dispatch CPU)");
+          std::ostringstream oss;
+          oss << "DeepEP error: timeout (dispatch CPU)"
+              << " rank=" << rank << "/" << num_ranks
+              << " rdma_rank=" << rdma_rank << "/" << num_rdma_ranks
+              << " nvl_rank=" << nvl_rank << "/" << num_nvl_ranks
+              << " device_index=" << device_index << " tokens=" << num_tokens
+              << " hidden=" << hidden << " num_channels=" << num_channels
+              << " moe_recv_counter=" << *moe_recv_counter
+              << " moe_recv_rdma_counter=" << *moe_recv_rdma_counter
+              << " local_expert_counters=[";
+          for (int i = 0; i < num_local_experts; ++i) {
+            if (i != 0) oss << ",";
+            oss << moe_recv_expert_counter[i];
+          }
+          oss << "]";
+          throw std::runtime_error(oss.str());
         }
       }
       num_recv_tokens_per_expert_list = std::vector<int>(
@@ -1069,15 +1091,15 @@ class Buffer {
 
     if (cached_mode) {
       uccl::internode::cached_notify(
-          hidden_int4, num_scales, num_topk, num_topk, num_ranks, num_channels,
-          0, nullptr,
+          hidden_int4, num_scales, num_topk, num_topk, num_ranks, num_nvl_ranks,
+          num_channels, 0, nullptr,
           reinterpret_cast<int const*>(rdma_channel_prefix_matrix_ptr),
           reinterpret_cast<int const*>(recv_rdma_rank_prefix_sum_ptr), nullptr,
           rdma_buffer_ptr, config.num_max_rdma_chunked_recv_tokens,
           buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens,
           barrier_signal_ptrs_gpu, rank, comm_stream,
-          config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4),
-                                           num_ranks),
+          config.get_rdma_buffer_size_hint_with_nvl(hidden_int4 * sizeof(int4),
+                                                    num_ranks, num_nvl_ranks),
           num_nvl_bytes, true, low_latency_mode, d_handles,
           num_d2h_channel_addrs, atomic_buffer_ptr);
     } else {
@@ -1126,8 +1148,8 @@ class Buffer {
         config.num_max_rdma_chunked_send_tokens,
         config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
         config.num_max_nvl_chunked_send_tokens,
-        config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, cached_mode,
-        comm_stream, num_channels, low_latency_mode, d_handles,
+        config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, num_nvl_ranks,
+        cached_mode, comm_stream, num_channels, low_latency_mode, d_handles,
         num_d2h_channel_addrs, atomic_buffer_ptr);
 
     std::optional<EventHandle> event;
@@ -1179,7 +1201,7 @@ class Buffer {
     }
 
     uccl::internode::cached_notify(
-        hidden_int4, 0, 0, num_topk, num_ranks, num_channels,
+        hidden_int4, 0, 0, num_topk, num_ranks, num_nvl_ranks, num_channels,
         num_combined_tokens, reinterpret_cast<int*>(combined_rdma_head_ptr),
         reinterpret_cast<int const*>(rdma_channel_prefix_matrix_ptr),
         reinterpret_cast<int const*>(rdma_rank_prefix_sum_ptr),
@@ -1187,7 +1209,8 @@ class Buffer {
         config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
         config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu, rank,
         comm_stream,
-        config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
+        config.get_rdma_buffer_size_hint_with_nvl(hidden_int4 * sizeof(int4),
+                                                  num_ranks, num_nvl_ranks),
         num_nvl_bytes, false, low_latency_mode, d_handles,
         num_d2h_channel_addrs, atomic_buffer_ptr);
 
@@ -1220,9 +1243,9 @@ class Buffer {
         config.num_max_rdma_chunked_send_tokens,
         config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
         config.num_max_nvl_chunked_send_tokens,
-        config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, comm_stream,
-        num_channels, low_latency_mode, d_handles, num_d2h_channel_addrs,
-        atomic_buffer_ptr);
+        config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, num_nvl_ranks,
+        comm_stream, num_channels, low_latency_mode, d_handles,
+        num_d2h_channel_addrs, atomic_buffer_ptr);
 
     std::optional<EventHandle> event;
     if (async) {
@@ -1533,6 +1556,7 @@ class Buffer {
   }
 
   int get_num_rdma_ranks() const { return num_rdma_ranks; }
+  int get_num_nvl_ranks() const { return num_nvl_ranks; }
   int get_num_max_nvl_peers() const { return NUM_MAX_NVL_PEERS; }
   int get_source_meta_bytes() const {
     return uccl::internode::get_source_meta_bytes();
@@ -1687,6 +1711,27 @@ class Buffer {
     if (ptr == nullptr) {
       throw std::invalid_argument("set_atomic_buffer_ptr: ptr null");
     }
+    CUDA_CHECK(cudaSetDevice(device_index));
+    cudaPointerAttributes attrs{};
+    cudaError_t attr_status = cudaPointerGetAttributes(&attrs, ptr);
+    if (attr_status == cudaSuccess) {
+#if CUDART_VERSION >= 10000
+      if (attrs.type == cudaMemoryTypeHost) {
+#else
+      if (attrs.memoryType == cudaMemoryTypeHost) {
+#endif
+        void* dev_ptr = nullptr;
+#ifndef USE_GRACE_HOPPER
+        CUDA_CHECK(cudaHostGetDevicePointer(&dev_ptr, ptr, 0));
+#else
+        dev_ptr = ptr;
+#endif
+        atomic_buffer_ptr = dev_ptr;
+        return;
+      }
+    } else {
+      (void)cudaGetLastError();
+    }
     atomic_buffer_ptr = ptr;
   }
 
@@ -1709,7 +1754,7 @@ class Buffer {
 
   bool is_available() const { return available; }
   bool is_internode_available() const {
-    return is_available() and num_ranks > NUM_MAX_NVL_PEERS;
+    return is_available() and num_ranks > num_nvl_ranks;
   }
 
  private:
@@ -1988,6 +2033,7 @@ NB_MODULE(ep, m) {
       .def("get_local_atomics_ipc_handle",
            &Buffer::get_local_atomics_ipc_handle)
       .def("get_num_rdma_ranks", &Buffer::get_num_rdma_ranks)
+      .def("get_num_nvl_ranks", &Buffer::get_num_nvl_ranks)
       .def("get_num_max_nvl_peers", &Buffer::get_num_max_nvl_peers)
       .def("get_source_meta_bytes", &Buffer::get_source_meta_bytes)
       .def("get_rdma_rank", &Buffer::get_rdma_rank)

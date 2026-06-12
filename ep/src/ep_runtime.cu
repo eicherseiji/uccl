@@ -64,7 +64,18 @@ void barrier(int** barrier_signal_ptrs, int rank, int num_ranks,
   break
 
   SETUP_LAUNCH_CONFIG(1, WARP_SIZE, stream);
-  SWITCH_RANKS(BARRIER_LAUNCH_CASE);
+  switch (num_ranks) {
+    case 1:
+      BARRIER_LAUNCH_CASE(1);
+    case 2:
+      BARRIER_LAUNCH_CASE(2);
+    case 4:
+      BARRIER_LAUNCH_CASE(4);
+    case 8:
+      BARRIER_LAUNCH_CASE(8);
+    default:
+      EP_HOST_ASSERT(false and "Unsupported ranks");
+  }
 #undef BARRIER_LAUNCH_CASE
 }
 

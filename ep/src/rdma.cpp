@@ -22,7 +22,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <regex>
@@ -388,15 +387,6 @@ bool is_cuda_host_pointer(void* ptr) {
 #endif
 }
 
-int get_gpu_numa_node_from_bdf(std::string const& bdf) {
-  std::ifstream file(
-      uccl::Format("/sys/bus/pci/devices/%s/numa_node", bdf.c_str()));
-  if (!file.is_open()) return -1;
-  std::string line;
-  if (!std::getline(file, line)) return -1;
-  return std::stoi(line);
-}
-
 }  // namespace
 
 void per_thread_rdma_init(ProxyCtx& S, void* gpu_buf, size_t bytes, int rank,
@@ -410,35 +400,43 @@ void per_thread_rdma_init(ProxyCtx& S, void* gpu_buf, size_t bytes, int rank,
     perror("Failed to get IB devices list");
     exit(1);
   }
-  int gpu_idx = nic_local_rank;
   cudaSetDevice(device_index);  // Needed.
 
-  // Map the physical GPU rank (gpu_idx) to its PCI BDF for NIC/NUMA affinity.
+  auto gpu_cards = uccl::get_gpu_cards();
+  if (device_index < 0 || device_index >= static_cast<int>(gpu_cards.size())) {
+    fprintf(stderr,
+            "[RDMA] invalid device_index=%d nic_local_rank=%d "
+            "(visible GPUs=%zu)\n",
+            device_index, nic_local_rank, gpu_cards.size());
+    std::abort();
+  }
+
+  // Resolve NIC/NUMA affinity from the actual CUDA-visible device BDF. This
+  // remains correct when Ray exposes one physical GPU per actor as cuda:0.
+  std::filesystem::path gpu_device_path = gpu_cards[device_index];
+  std::string gpu_bdf =
+      uccl::normalize_pci_bus_id(gpu_device_path.filename().string());
+
   auto all_gpu_bdfs = uccl::enumerate_all_gpu_bdfs();
-  std::filesystem::path gpu_device_path;
-  std::string gpu_bdf;
-  if (gpu_idx >= 0 && gpu_idx < static_cast<int>(all_gpu_bdfs.size())) {
+  auto bdf_it = std::find(all_gpu_bdfs.begin(), all_gpu_bdfs.end(), gpu_bdf);
+  int gpu_idx = -1;
+  if (bdf_it != all_gpu_bdfs.end()) {
+    gpu_idx = static_cast<int>(std::distance(all_gpu_bdfs.begin(), bdf_it));
+  } else if (nic_local_rank >= 0 &&
+             nic_local_rank < static_cast<int>(all_gpu_bdfs.size())) {
+    gpu_idx = nic_local_rank;
     gpu_bdf = all_gpu_bdfs[gpu_idx];
     gpu_device_path = std::filesystem::path("/sys/bus/pci/devices") / gpu_bdf;
-  } else {
-    // Fallback when the physical GPU scan is unavailable.
-    auto gpu_cards = uccl::get_gpu_cards();
-    if (device_index < 0 ||
-        device_index >= static_cast<int>(gpu_cards.size())) {
-      fprintf(stderr,
-              "[RDMA] invalid device_index=%d nic_local_rank=%d "
-              "(visible GPUs=%zu, physical GPUs=%zu)\n",
-              device_index, nic_local_rank, gpu_cards.size(),
-              all_gpu_bdfs.size());
-      std::abort();
-    }
-    gpu_idx = device_index;
-    gpu_device_path = gpu_cards[gpu_idx];
     fprintf(stderr,
-            "[RDMA] physical GPU scan unavailable (%zu entries); falling back "
-            "to CUDA-visible indexing by device_index=%d. NIC/NUMA affinity "
-            "may be wrong if this process sees more than one GPU.\n",
-            all_gpu_bdfs.size(), device_index);
+            "[RDMA] CUDA device BDF not found in physical GPU scan; falling "
+            "back to nic_local_rank=%d for NIC/NUMA affinity.\n",
+            nic_local_rank);
+  } else {
+    gpu_idx = device_index;
+    fprintf(stderr,
+            "[RDMA] physical GPU rank unavailable for BDF %s; falling back "
+            "to CUDA-visible device_index=%d for NIC striping.\n",
+            gpu_bdf.c_str(), device_index);
   }
   // Ranked by RDMA NIC name (not the ibv_get_device_list order)
   auto ib_nics = uccl::get_rdma_nics();
@@ -504,7 +502,7 @@ void per_thread_rdma_init(ProxyCtx& S, void* gpu_buf, size_t bytes, int rank,
       // NUMA-aware tie-breaker: prefer NICs on same NUMA node as GPU
       int gpu_numa_node = gpu_bdf.empty()
                               ? uccl::get_gpu_numa_node(device_index)
-                              : get_gpu_numa_node_from_bdf(gpu_bdf);
+                              : uccl::get_gpu_numa_node_from_bdf(gpu_bdf);
       std::vector<std::string> numa_candidates;
       for (auto const& nic_name : candidates) {
         int nic_numa = uccl::get_dev_numa_node(nic_name.c_str());
@@ -1427,7 +1425,8 @@ static void post_rdma_async_batched_normal_mode(
     ProxyCtx& S, void* buf, size_t num_wrs,
     std::vector<uint64_t> const& wrs_to_post,
     std::vector<TransferCmd> const& cmds_to_post,
-    std::vector<std::unique_ptr<ProxyCtx>>& ctxs, int my_rank, int thread_idx) {
+    std::vector<std::unique_ptr<ProxyCtx>>& ctxs, int my_rank, int thread_idx,
+    bool virtual_single_rank_nodes) {
   if (num_wrs == 0) return;
   if (wrs_to_post.size() != num_wrs || cmds_to_post.size() != num_wrs) {
     fprintf(stderr, "Size mismatch (num_wrs=%zu, wr_ids=%zu, cmds=%zu)\n",
@@ -1442,9 +1441,10 @@ static void post_rdma_async_batched_normal_mode(
       printf("Posting rdma to itself\n");
       std::abort();
       continue;
-    } else if (std::abs((int)cmds_to_post[i].dst_rank - (int)my_rank) %
-                   MAX_NUM_GPUS !=
-               0) {
+    } else if (!virtual_single_rank_nodes &&
+               std::abs((int)cmds_to_post[i].dst_rank - (int)my_rank) %
+                       MAX_NUM_GPUS !=
+                   0) {
       // NOTE(MaoZiming): this should not happen.
       printf("Posting rdma to a different rank\n");
       std::abort();
@@ -2116,11 +2116,12 @@ void post_rdma_async_batched(ProxyCtx& S, void* buf, size_t num_wrs,
                              std::vector<uint64_t> const& wrs_to_post,
                              std::vector<TransferCmd> const& cmds_to_post,
                              std::vector<std::unique_ptr<ProxyCtx>>& ctxs,
-                             int my_rank, int thread_idx,
-                             bool use_normal_mode) {
+                             int my_rank, int thread_idx, bool use_normal_mode,
+                             bool virtual_single_rank_nodes) {
   if (use_normal_mode) {
-    post_rdma_async_batched_normal_mode(
-        S, buf, num_wrs, wrs_to_post, cmds_to_post, ctxs, my_rank, thread_idx);
+    post_rdma_async_batched_normal_mode(S, buf, num_wrs, wrs_to_post,
+                                        cmds_to_post, ctxs, my_rank, thread_idx,
+                                        virtual_single_rank_nodes);
   } else {
     post_rdma_async_batched_fast_mode(S, buf, num_wrs, wrs_to_post,
                                       cmds_to_post, ctxs, my_rank, thread_idx);

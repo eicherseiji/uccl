@@ -24,6 +24,9 @@ try:
         initialize_uccl,
         destroy_uccl,
         _fp8_e4m3_dtype,
+        _cuda_visible_device_count,
+        _current_cuda_device_index,
+        _ray_assigned_gpu_ids,
     )
 except ImportError:
     from utils import (
@@ -32,6 +35,9 @@ except ImportError:
         initialize_uccl,
         destroy_uccl,
         _fp8_e4m3_dtype,
+        _cuda_visible_device_count,
+        _current_cuda_device_index,
+        _ray_assigned_gpu_ids,
     )
 
 
@@ -109,7 +115,9 @@ class Buffer:
         if "LOCAL_RANK" in os.environ:
             device_index = int(os.environ["LOCAL_RANK"])
         else:
-            device_index = torch.cuda.current_device()
+            device_index = _current_cuda_device_index()
+        if torch.cuda.is_available():
+            torch.cuda.set_device(device_index)
 
         if hasattr(ep, "get_rdma_buffer"):
             # Allocate outside PyTorch's CUDA allocator so RDMA/IPC sees a raw
@@ -150,7 +158,14 @@ class Buffer:
                 )
 
         rdma_buffer_ptr = self.scratch.data_ptr()
-        _local_world = int(os.environ.get("LOCAL_WORLD_SIZE", -1))
+        if "LOCAL_WORLD_SIZE" in os.environ:
+            _local_world = int(os.environ["LOCAL_WORLD_SIZE"])
+        else:
+            visible_count = _cuda_visible_device_count()
+            # Ray/vLLM DP actors often expose one GPU per process while the EP
+            # group spans all DP ranks. CUDA IPC to node-local peers is not
+            # possible in that topology, so use one-rank NVL groups.
+            _local_world = 1 if visible_count == 1 else -1
         self.proxies, self.workers = initialize_uccl(
             rdma_buffer_ptr,
             num_rdma_bytes,
@@ -183,6 +198,20 @@ class Buffer:
         )
         if num_rdma_bytes:
             self.runtime.set_rdma_buffer(rdma_buffer_ptr, rdma_buffer_is_host_allocated)
+        if os.environ.get("UCCL_DEBUG_RANK_SPLIT"):
+            print(
+                "[UCCL rank split] "
+                f"rank={self.rank}/{self.group_size} "
+                f"device_index={device_index} "
+                f"torch_current={torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'} "
+                f"runtime_device={self.runtime.get_local_device_id()} "
+                f"rdma_rank={self.runtime.get_rdma_rank()}/{self.runtime.get_num_rdma_ranks()} "
+                f"num_nvl_ranks={self.runtime.get_num_nvl_ranks()} "
+                f"LOCAL_WORLD_SIZE={os.environ.get('LOCAL_WORLD_SIZE')} "
+                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} "
+                f"ray_gpu_ids={_ray_assigned_gpu_ids()}",
+                flush=True,
+            )
 
         # Synchronize device IDs
         device_ids = [

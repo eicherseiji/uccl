@@ -99,21 +99,91 @@ def _gather_peer_ips(group):
     return ips
 
 
-def detect_group_topology(group: dist.ProcessGroup) -> Tuple[int, int, int, int, bool]:
+def _physical_rank_from_visible_devices(local_rank: int) -> Optional[int]:
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible_devices:
+        return None
+
+    tokens = [token.strip() for token in visible_devices.split(",") if token.strip()]
+    if not tokens:
+        return None
+
+    token = tokens[local_rank] if local_rank < len(tokens) else tokens[0]
+    return int(token) if token.isdigit() else None
+
+
+def _cuda_ordinal_for_physical_rank(physical_rank: int) -> Optional[int]:
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible_devices:
+        return None
+
+    tokens = [token.strip() for token in visible_devices.split(",") if token.strip()]
+    for ordinal, token in enumerate(tokens):
+        if token.isdigit() and int(token) == physical_rank:
+            return ordinal
+    return None
+
+
+def _cuda_visible_device_count() -> Optional[int]:
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible_devices is None:
+        return None
+
+    return len([token for token in visible_devices.split(",") if token.strip()])
+
+
+def _ray_assigned_gpu_ids() -> list[int]:
+    try:
+        import ray
+
+        if not ray.is_initialized():
+            return []
+        gpu_ids = ray.get_gpu_ids()
+    except Exception:
+        return []
+
+    parsed: list[int] = []
+    for gpu_id in gpu_ids:
+        try:
+            parsed.append(int(gpu_id))
+        except (TypeError, ValueError):
+            try:
+                parsed.append(int(float(gpu_id)))
+            except (TypeError, ValueError):
+                pass
+    return parsed
+
+
+def _ray_assigned_gpu_id() -> Optional[int]:
+    gpu_ids = _ray_assigned_gpu_ids()
+    return gpu_ids[0] if len(gpu_ids) == 1 else None
+
+
+def _current_cuda_device_index() -> int:
+    if torch.cuda.is_available():
+        return torch.cuda.current_device()
+    return int(os.environ.get("LOCAL_RANK", 0))
+
+
+def detect_group_topology(
+    group: dist.ProcessGroup,
+) -> Tuple[int, int, int, int, int, int, bool]:
     """
     Infer CUDA-local rank, barrier-local rank, and node topology.
 
     Returns:
         local_rank: CUDA-visible device index for the current process.
+        nic_local_rank: physical GPU rank used for NIC/NUMA affinity.
         barrier_local_rank: rank slot within the current node.
+        num_local_ranks: number of ranks within the current node.
         node_idx: compact node index within the given group.
         num_nodes: number of distinct nodes spanned by the group.
         is_intranode: whether all ranks in the group are on the same node.
     """
-    if "LOCAL_RANK" in os.environ:
-        local_rank = int(os.environ["LOCAL_RANK"])
-    else:
-        local_rank = torch.cuda.current_device()
+    # Ray/vLLM actors can expose one physical GPU per process as cuda:0, while
+    # LOCAL_RANK may be unset or stale. Use the runtime CUDA ordinal for CUDA
+    # calls, and keep physical/NIC rank separate.
+    local_rank = _current_cuda_device_index()
 
     node_token = ep.get_oob_ip() or socket.gethostname()
 
@@ -121,8 +191,35 @@ def detect_group_topology(group: dist.ProcessGroup) -> Tuple[int, int, int, int,
     node_tokens = [None] * world
     dist.all_gather_object(node_tokens, node_token, group=group)
     rank = dist.get_rank(group)
+    assigned_gpu_id = _ray_assigned_gpu_id()
+    visible_physical_rank = _physical_rank_from_visible_devices(local_rank)
+    nic_local_rank = (
+        visible_physical_rank
+        if visible_physical_rank is not None
+        else assigned_gpu_id
+    )
+    visible_count = _cuda_visible_device_count()
+    if visible_count == 1:
+        # CUDA IPC cannot be opened to same-node peer ranks when this process
+        # can see only one GPU. Treat every process as its own NVL group and
+        # use RDMA/proxy paths for all non-self peers.
+        if nic_local_rank is None:
+            nic_local_rank = 0
+        return (
+            local_rank,
+            nic_local_rank,
+            0,
+            1,
+            rank,
+            world,
+            world == 1,
+        )
+
     local_ranks = [idx for idx, token in enumerate(node_tokens) if token == node_token]
     barrier_local_rank = local_ranks.index(rank)
+    num_local_ranks = len(local_ranks)
+    if nic_local_rank is None:
+        nic_local_rank = barrier_local_rank
 
     token_to_idx = {}
     for token in node_tokens:
@@ -132,7 +229,15 @@ def detect_group_topology(group: dist.ProcessGroup) -> Tuple[int, int, int, int,
     node_idx = token_to_idx[node_token]
     num_nodes = len(token_to_idx)
     is_intranode = num_nodes == 1
-    return local_rank, barrier_local_rank, node_idx, num_nodes, is_intranode
+    return (
+        local_rank,
+        nic_local_rank,
+        barrier_local_rank,
+        num_local_ranks,
+        node_idx,
+        num_nodes,
+        is_intranode,
+    )
 
 
 def get_peer_ip(rank: int, num_ranks: int, group: dist.ProcessGroup):
@@ -568,11 +673,18 @@ def initialize_uccl(
 
     (
         local_rank,
+        nic_local_rank,
         barrier_local_rank,
+        num_local_ranks,
         node_idx,
         num_nodes,
         detected_is_intranode,
     ) = detect_group_topology(group)
+    if "LOCAL_WORLD_SIZE" not in os.environ:
+        visible_count = _cuda_visible_device_count()
+        os.environ["LOCAL_WORLD_SIZE"] = (
+            "1" if visible_count == 1 else str(num_local_ranks)
+        )
     if is_intranode is None:
         is_intranode = detected_is_intranode
     elif is_intranode and not detected_is_intranode:
@@ -598,7 +710,7 @@ def initialize_uccl(
             gpu_buffer_is_host_allocated=rdma_buffer_is_host_allocated,
             barrier_local_rank=barrier_local_rank,
             device_index=local_rank,
-            nic_local_rank=barrier_local_rank,
+            nic_local_rank=nic_local_rank,
         )
         proxies.append(proxy)
 
